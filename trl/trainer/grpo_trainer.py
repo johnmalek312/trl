@@ -1501,11 +1501,14 @@ class GRPOTrainer(BaseTrainer):
             # Use existing _generate method
             if has_images:
                 # For multimodal, need to prepare inputs with images
-                prompts_for_gen = [inp["prompt"] for inp in gen_inputs]
-                images_for_gen = [inp.get("image") for inp in gen_inputs]
+                prompts_for_gen = gen_prompts
+                # Convert to list of lists format (each prompt can have multiple images)
+                images_for_gen = [[img] if img is not None else None for img in gen_images]
+                # Prepare multimodal messages
+                prompts_for_gen = [prepare_multimodal_messages(prompt, image_list)
+                                   for prompt, image_list in zip(prompts_for_gen, images_for_gen)]
             else:
                 prompts_for_gen = gen_prompts
-                images_for_gen = None
 
             # Call _generate (handles chat template, tokenization, etc.)
             # This is the existing TRL method
