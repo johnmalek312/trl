@@ -1373,9 +1373,423 @@ class GRPOTrainer(BaseTrainer):
 
         return prompt_ids, completion_ids, total_completion_tokens, logprobs, extra_fields
 
+    def _generate_and_score_trajectories(
+        self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        """
+        Generate multiple trajectories per prompt in parallel (turn-by-turn).
+
+        Args:
+            inputs: List of dataset items with "prompt", "image", etc.
+
+        Returns:
+            dict with flattened trajectory data ready for loss computation
+        """
+        device = self.accelerator.device
+        num_prompts = len(inputs)
+        num_generations = self.args.num_generations
+
+        # Create environment instances
+        # Shape: (num_prompts, num_generations)
+        environments = [
+            [self.args.environment_fn(inputs[i]) for _ in range(num_generations)]
+            for i in range(num_prompts)
+        ]
+
+        # Initialize trajectories
+        # Shape: (num_prompts, num_generations)
+        trajectories = [
+            [
+                {
+                    "initial_input": inputs[i],
+                    "env": environments[i][j],
+                    "turns": [],
+                    "done": False,
+                    "terminated_naturally": False,
+                    "trajectory_length": 0,
+                    "current_data": None,  # Will be set after env.reset()
+                }
+                for j in range(num_generations)
+            ]
+            for i in range(num_prompts)
+        ]
+
+        # Reset all environments to get initial prompt data
+        for i in range(num_prompts):
+            for j in range(num_generations):
+                traj = trajectories[i][j]
+                traj["current_data"] = traj["env"].reset()
+
+        # Turn-by-turn parallel generation
+        turn_idx = 0
+        max_turns = self.args.max_trajectory_length
+
+        while True:
+            # Check if we've hit max_turns limit (if set)
+            if max_turns is not None and turn_idx >= max_turns:
+                break
+
+            # Get all active trajectories (not done yet)
+            active_trajectories = []
+            active_indices = []  # (prompt_idx, gen_idx) pairs
+
+            for i in range(num_prompts):
+                for j in range(num_generations):
+                    if not trajectories[i][j]["done"]:
+                        active_trajectories.append(trajectories[i][j])
+                        active_indices.append((i, j))
+
+            if len(active_trajectories) == 0:
+                break  # All trajectories finished
+
+            # Prepare generation inputs from current_data
+            # Handle both text-only and multimodal cases
+            gen_prompts = []
+            gen_images = []
+            has_images = False
+
+            for traj in active_trajectories:
+                current_data = traj["current_data"]
+                prompt = current_data.get("prompt", current_data.get("text", ""))
+                image = current_data.get("image")
+
+                gen_prompts.append(prompt)
+                gen_images.append(image)
+
+                if image is not None:
+                    has_images = True
+
+            # Build generation input dicts
+            gen_inputs = []
+            for idx, (prompt, image) in enumerate(zip(gen_prompts, gen_images)):
+                inp = {"prompt": prompt}
+                if has_images:
+                    inp["image"] = image if image is not None else gen_images[0]  # Placeholder if None
+                gen_inputs.append(inp)
+
+            # PARALLEL GENERATION: Generate for all active trajectories at once
+            # Use existing _generate method
+            if has_images:
+                # For multimodal, need to prepare inputs with images
+                prompts_for_gen = [inp["prompt"] for inp in gen_inputs]
+                images_for_gen = [inp.get("image") for inp in gen_inputs]
+            else:
+                prompts_for_gen = gen_prompts
+                images_for_gen = None
+
+            # Call _generate (handles chat template, tokenization, etc.)
+            # This is the existing TRL method
+            prompt_ids_list, completion_ids_list, _, sampling_logps_list, _ = self._generate(prompts_for_gen)
+
+            # Process each generated completion
+            for idx, (prompt_idx, gen_idx) in enumerate(active_indices):
+                traj = trajectories[prompt_idx][gen_idx]
+
+                # Decode completion
+                completion_text = self.processing_class.decode(
+                    completion_ids_list[idx], skip_special_tokens=True
+                )
+
+                # Store turn data
+                turn_data = {
+                    "current_data": traj["current_data"].copy(),
+                    "prompt_ids": prompt_ids_list[idx],
+                    "completion": completion_text,
+                    "completion_ids": completion_ids_list[idx],
+                    "sampling_logps": sampling_logps_list[idx] if sampling_logps_list else None,
+                    "turn_idx": turn_idx,
+                }
+                traj["turns"].append(turn_data)
+                traj["trajectory_length"] += 1
+
+                # Step environment with current_data and llm_response
+                new_data, done, info = traj["env"].step(traj["current_data"], completion_text)
+
+                traj["done"] = done
+                traj["terminated_naturally"] = done
+
+                # Update current_data for next turn
+                if not done:
+                    traj["current_data"] = new_data
+
+            turn_idx += 1
+
+        # Extract rewards from environments
+        for i in range(num_prompts):
+            for j in range(num_generations):
+                traj = trajectories[i][j]
+                traj["reward"] = traj["env"].get_reward()
+
+        # Flatten trajectories for loss computation
+        return self._flatten_trajectories(trajectories, device)
+
+    def _flatten_trajectories(
+        self,
+        trajectories: list[list[dict]],
+        device: torch.device,
+    ) -> dict:
+        """
+        Flatten variable-length trajectories into format compatible with GRPO loss.
+
+        Args:
+            trajectories: Shape (num_prompts, num_generations), each is a trajectory dict
+            device: Target device for tensors
+
+        Returns:
+            dict with keys matching standard GRPO format:
+                - prompt_ids, prompt_mask: (total_turns, max_prompt_len)
+                - completion_ids, completion_mask: (total_turns, max_completion_len)
+                - advantages: (total_turns,) - same advantage for all turns in trajectory
+                - old_per_token_logps, ref_per_token_logps: if applicable
+                - num_items_in_batch: total number of tokens (for DAPO)
+        """
+        num_prompts = len(trajectories)
+        num_generations = len(trajectories[0])
+
+        # Collect all turns and rewards
+        all_prompt_ids = []
+        all_completion_ids = []
+        all_sampling_logps = []
+        trajectory_rewards = []  # Shape: (num_prompts, num_generations)
+        trajectory_turn_counts = []  # Number of turns per trajectory
+
+        for i in range(num_prompts):
+            prompt_group_rewards = []
+            for j in range(num_generations):
+                traj = trajectories[i][j]
+                prompt_group_rewards.append(traj["reward"])
+                trajectory_turn_counts.append(traj["trajectory_length"])
+
+                for turn in traj["turns"]:
+                    all_prompt_ids.append(turn["prompt_ids"])
+                    all_completion_ids.append(turn["completion_ids"])
+                    if turn["sampling_logps"] is not None:
+                        all_sampling_logps.append(turn["sampling_logps"])
+
+            trajectory_rewards.append(prompt_group_rewards)
+
+        # Compute group-relative advantages
+        # Shape: (num_prompts, num_generations)
+        advantages_per_trajectory = self._compute_trajectory_advantages(trajectory_rewards)
+
+        # Expand advantages to per-turn level
+        # Each turn in a trajectory gets the same advantage
+        all_advantages = []
+        for i in range(num_prompts):
+            for j in range(num_generations):
+                traj_advantage = advantages_per_trajectory[i][j]
+                num_turns = trajectory_turn_counts[i * num_generations + j]
+                all_advantages.extend([traj_advantage] * num_turns)
+
+        # Convert to tensors and pad
+        prompt_ids = [torch.tensor(ids, device=device) for ids in all_prompt_ids]
+        prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
+        prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
+        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+
+        completion_ids = [torch.tensor(ids, device=device) for ids in all_completion_ids]
+        completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
+        completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
+        completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+
+        if all_sampling_logps:
+            sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in all_sampling_logps]
+            sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0, padding_side="right")
+        else:
+            sampling_per_token_logps = None
+
+        # Mask truncated completions if enabled
+        if self.mask_truncated_completions:
+            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            is_truncated = torch.tensor(
+                [ids[-1] not in eos_and_pad for ids in all_completion_ids],
+                device=device
+            )
+            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+
+        # Prepare data dict
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        batch_size = self.args.per_device_train_batch_size
+
+        # Compute old_per_token_logps and ref_per_token_logps
+        # IMPORTANT: Batch this to avoid OOM (32 turns at a time)
+        with torch.no_grad():
+            # Check if we need importance sampling
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                self.use_vllm and self.vllm_importance_sampling_correction
+            ):
+                # Need to compute old policy logps
+                old_per_token_logps = self._get_batched_logps(
+                    self.model,
+                    prompt_completion_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size=32,  # Process 32 turns at a time
+                )
+            else:
+                old_per_token_logps = None
+
+            # Compute vLLM importance sampling correction
+            if self.use_vllm and self.vllm_importance_sampling_correction and sampling_per_token_logps is not None:
+                importance_sampling_ratio = torch.exp(old_per_token_logps - sampling_per_token_logps)
+                importance_sampling_ratio = torch.clamp(
+                    importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                )
+            else:
+                importance_sampling_ratio = None
+
+            # Compute reference policy logps
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    ref_per_token_logps = self._get_batched_logps(
+                        self.ref_model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=32,
+                    )
+                else:
+                    # Disable adapter for ref policy
+                    ref_per_token_logps = self._get_batched_logps(
+                        self.model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=32,
+                        disable_adapter=True,
+                    )
+            else:
+                ref_per_token_logps = None
+
+        # Calculate num_items_in_batch for DAPO
+        # This is the total number of active tokens across all turns
+        num_items_in_batch = completion_mask.sum().item()
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": torch.tensor(all_advantages, device=device, dtype=torch.float32),
+            "old_per_token_logps": old_per_token_logps,
+            "ref_per_token_logps": ref_per_token_logps,
+            "importance_sampling_ratio": importance_sampling_ratio,
+            "num_items_in_batch": num_items_in_batch,
+        }
+
+    def _get_batched_logps(
+        self,
+        model,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        batch_size: int = 32,
+        disable_adapter: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute per-token log probabilities in batches to avoid OOM.
+
+        Args:
+            model: Model to use for computation
+            input_ids: (total_turns, seq_len)
+            attention_mask: (total_turns, seq_len)
+            logits_to_keep: Number of completion tokens
+            batch_size: Number of turns to process at once
+            disable_adapter: Whether to disable LoRA adapter (for ref policy)
+
+        Returns:
+            per_token_logps: (total_turns, logits_to_keep)
+        """
+        total_turns = input_ids.size(0)
+        all_logps = []
+
+        for start_idx in range(0, total_turns, batch_size):
+            end_idx = min(start_idx + batch_size, total_turns)
+            batch_input_ids = input_ids[start_idx:end_idx]
+            batch_attention_mask = attention_mask[start_idx:end_idx]
+
+            if disable_adapter:
+                with self.accelerator.unwrap_model(model).disable_adapter():
+                    batch_logps, _ = self._get_per_token_logps_and_entropies(
+                        model,
+                        batch_input_ids,
+                        batch_attention_mask,
+                        logits_to_keep,
+                        batch_size=batch_input_ids.size(0),
+                    )
+            else:
+                batch_logps, _ = self._get_per_token_logps_and_entropies(
+                    model,
+                    batch_input_ids,
+                    batch_attention_mask,
+                    logits_to_keep,
+                    batch_size=batch_input_ids.size(0),
+                )
+
+            all_logps.append(batch_logps)
+
+        return torch.cat(all_logps, dim=0)
+
+    def _compute_trajectory_advantages(
+        self,
+        trajectory_rewards: list[list[float]],
+    ) -> list[list[float]]:
+        """
+        Compute group-relative advantages for trajectories.
+
+        Args:
+            trajectory_rewards: Shape (num_prompts, num_generations)
+
+        Returns:
+            advantages: Shape (num_prompts, num_generations)
+        """
+        advantages = []
+
+        for prompt_rewards in trajectory_rewards:
+            # Group-relative advantage: reward - mean(group_rewards)
+            prompt_rewards_tensor = torch.tensor(prompt_rewards, dtype=torch.float32)
+
+            # Apply reward scaling based on config
+            if self.args.scale_rewards == "group":
+                # Scale by group std (default)
+                std = prompt_rewards_tensor.std()
+                if std > 1e-8:
+                    scaled_rewards = prompt_rewards_tensor / std
+                else:
+                    scaled_rewards = prompt_rewards_tensor
+            elif self.args.scale_rewards == "batch":
+                # Will be scaled later across entire batch
+                scaled_rewards = prompt_rewards_tensor
+            else:  # "none"
+                scaled_rewards = prompt_rewards_tensor
+
+            # Compute advantages (reward - mean)
+            mean_reward = scaled_rewards.mean()
+            prompt_advantages = (scaled_rewards - mean_reward).tolist()
+            advantages.append(prompt_advantages)
+
+        # Apply batch-level scaling if needed
+        if self.args.scale_rewards == "batch":
+            all_rewards = [r for group in trajectory_rewards for r in group]
+            all_rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
+            std = all_rewards_tensor.std()
+            if std > 1e-8:
+                advantages = [[adv / std for adv in group] for group in advantages]
+
+        return advantages
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        # Check if trajectory mode
+        if self.args.trajectory_mode:
+            return self._generate_and_score_trajectories(inputs)
+
+        # Original standard GRPO path continues here...
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 

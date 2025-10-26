@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 from transformers import TrainingArguments
 
@@ -313,6 +313,32 @@ class GRPOConfig(TrainingArguments):
     max_completion_length: Optional[int] = field(
         default=256,
         metadata={"help": "Maximum length of the generated completion."},
+    )
+    trajectory_mode: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable trajectory mode for environment-driven multi-turn generation. When enabled, the trainer "
+            "generates complete trajectories by interacting with an environment until termination, rather than "
+            "generating fixed-length single responses."
+        },
+    )
+    environment_fn: Optional[Callable] = field(
+        default=None,
+        metadata={
+            "help": "Function that creates environment instances for trajectory generation. Should accept a dataset "
+            "item (dict) and return an environment object with:\n"
+            "  - reset() -> dict: Returns initial prompt data with keys 'prompt' (str or list) and 'image' (PIL.Image or None)\n"
+            "  - step(current_data: dict, llm_response: str) -> (new_data: dict, done: bool, info: dict)\n"
+            "  - get_reward() -> float\n"
+            "Required when `trajectory_mode=True`."
+        },
+    )
+    max_trajectory_length: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of turns per trajectory. If None, trajectories continue until environment signals done. "
+            "If set, trajectories exceeding this length will be terminated early. Only used when `trajectory_mode=True`."
+        },
     )
     ds3_gather_for_generation: bool = field(
         default=True,
@@ -640,6 +666,13 @@ class GRPOConfig(TrainingArguments):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
         super().__post_init__()
+
+        # Validate trajectory mode settings
+        if self.trajectory_mode:
+            if self.environment_fn is None:
+                raise ValueError("trajectory_mode=True requires environment_fn to be specified")
+            if self.max_trajectory_length is not None and self.max_trajectory_length < 1:
+                raise ValueError(f"max_trajectory_length must be >= 1 or None, got {self.max_trajectory_length}")
 
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
 
