@@ -1776,15 +1776,24 @@ def split_tensor_dict(
     ]
     ```
     """
-    first_tensor = next(tensor for tensor in tensor_dict.values() if tensor is not None)
+    # Find the first tensor (not scalar) to determine chunk size
+    first_tensor = next(
+        tensor for tensor in tensor_dict.values()
+        if tensor is not None and hasattr(tensor, 'shape')
+    )
     chunk_size = first_tensor.shape[0] // num_chunks
     chunks = []
     for i in range(num_chunks):
         chunk_dict = {}
         for key, tensor in tensor_dict.items():
-            if tensor is not None and (isinstance(tensor, list) or tensor.ndim > 0):
+            # Handle scalar types (int, float) - keep them unchanged
+            if isinstance(tensor, (int, float)):
+                chunk_dict[key] = tensor
+            # Handle tensors and lists
+            elif tensor is not None and (isinstance(tensor, list) or (hasattr(tensor, 'ndim') and tensor.ndim > 0)):
                 chunk_dict[key] = tensor[i * chunk_size : (i + 1) * chunk_size]
-            elif tensor is not None and tensor.ndim == 0:
+            # Handle 0-dimensional tensors
+            elif tensor is not None and hasattr(tensor, 'ndim') and tensor.ndim == 0:
                 chunk_dict[key] = tensor
             else:
                 chunk_dict[key] = None
