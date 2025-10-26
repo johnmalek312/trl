@@ -233,7 +233,7 @@ class GRPOTrainer(BaseTrainer):
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
-        reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        reward_funcs: Optional[Union[RewardFunc, list[RewardFunc]]] = None,
         args: Optional[GRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
@@ -249,6 +249,24 @@ class GRPOTrainer(BaseTrainer):
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
+
+        # Validate reward_funcs vs trajectory_mode
+        if args.trajectory_mode:
+            # In trajectory mode, rewards come from environment.get_reward()
+            if reward_funcs is not None:
+                logger.warning(
+                    "You specified both `trajectory_mode=True` and `reward_funcs`. "
+                    "In trajectory mode, rewards are provided by the environment's `get_reward()` method. "
+                    "The `reward_funcs` will be ignored."
+                )
+            reward_funcs = None  # Ensure it's None for trajectory mode
+        else:
+            # Standard GRPO mode requires reward_funcs
+            if reward_funcs is None:
+                raise ValueError(
+                    "You must specify `reward_funcs` unless using `trajectory_mode=True`. "
+                    "Either provide reward functions or enable trajectory mode with an environment_fn."
+                )
 
         # Models
         # Trained model
@@ -308,55 +326,65 @@ class GRPOTrainer(BaseTrainer):
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
 
-        # Reward functions
-        if not isinstance(reward_funcs, list):
-            reward_funcs = [reward_funcs]
-        self.reward_func_names = []
-        for i, reward_func in enumerate(reward_funcs):
-            if isinstance(reward_func, str):
-                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
-                    reward_func, num_labels=1, **model_init_kwargs
-                )
-            if isinstance(reward_funcs[i], nn.Module):  # Use Module over PretrainedModel for compat w/ compiled models
-                self.reward_func_names.append(get_config_model_id(reward_funcs[i].config).split("/")[-1])
-            else:
-                self.reward_func_names.append(reward_funcs[i].__name__)
-        self.reward_funcs = reward_funcs
-
-        # Reward weights
-        if args.reward_weights is not None:
-            if len(args.reward_weights) != len(reward_funcs):
-                raise ValueError(
-                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
-                    f"functions ({len(reward_funcs)})"
-                )
-            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
+        # Reward functions (skip in trajectory mode)
+        if args.trajectory_mode:
+            # In trajectory mode, we don't use reward functions
+            self.reward_funcs = []
+            self.reward_func_names = []
         else:
-            self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
+            # Standard GRPO mode with reward functions
+            if not isinstance(reward_funcs, list):
+                reward_funcs = [reward_funcs]
+            self.reward_func_names = []
+            for i, reward_func in enumerate(reward_funcs):
+                if isinstance(reward_func, str):
+                    reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                        reward_func, num_labels=1, **model_init_kwargs
+                    )
+                if isinstance(reward_funcs[i], nn.Module):  # Use Module over PretrainedModel for compat w/ compiled models
+                    self.reward_func_names.append(get_config_model_id(reward_funcs[i].config).split("/")[-1])
+                else:
+                    self.reward_func_names.append(reward_funcs[i].__name__)
+            self.reward_funcs = reward_funcs
 
-        # Reward processing class
-        if reward_processing_classes is None:
-            reward_processing_classes = [None] * len(reward_funcs)
-        elif not isinstance(reward_processing_classes, list):
-            reward_processing_classes = [reward_processing_classes]
-        if len(reward_processing_classes) != len(reward_funcs):
-            raise ValueError(
-                f"The number of reward processing classes ({len(reward_processing_classes)}) must match the number of "
-                f"reward functions ({len(reward_funcs)})."
-            )
+        # Reward weights (skip in trajectory mode)
+        if args.trajectory_mode:
+            self.reward_weights = torch.ones(0, dtype=torch.float32)  # Empty tensor
+            self.reward_processing_classes = []
+        else:
+            if args.reward_weights is not None:
+                if len(args.reward_weights) != len(reward_funcs):
+                    raise ValueError(
+                        f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
+                        f"functions ({len(reward_funcs)})"
+                    )
+                self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
+            else:
+                self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
 
-        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
-            if isinstance(reward_func, PreTrainedModel):
-                if reward_processing_class is None:
-                    reward_processing_class = AutoTokenizer.from_pretrained(get_config_model_id(reward_func.config))
-                if reward_processing_class.pad_token_id is None:
-                    reward_processing_class.pad_token = reward_processing_class.eos_token
-                # The reward model computes the reward for the latest non-padded token in the input sequence.
-                # So it's important to set the pad token ID to the padding token ID of the processing class.
-                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
-                reward_processing_classes[i] = reward_processing_class
+            # Reward processing class
+            if reward_processing_classes is None:
+                reward_processing_classes = [None] * len(reward_funcs)
+            elif not isinstance(reward_processing_classes, list):
+                reward_processing_classes = [reward_processing_classes]
+            if len(reward_processing_classes) != len(reward_funcs):
+                raise ValueError(
+                    f"The number of reward processing classes ({len(reward_processing_classes)}) must match the number of "
+                    f"reward functions ({len(reward_funcs)})."
+                )
 
-        self.reward_processing_classes = reward_processing_classes
+            for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+                if isinstance(reward_func, PreTrainedModel):
+                    if reward_processing_class is None:
+                        reward_processing_class = AutoTokenizer.from_pretrained(get_config_model_id(reward_func.config))
+                    if reward_processing_class.pad_token_id is None:
+                        reward_processing_class.pad_token = reward_processing_class.eos_token
+                    # The reward model computes the reward for the latest non-padded token in the input sequence.
+                    # So it's important to set the pad token ID to the padding token ID of the processing class.
+                    reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                    reward_processing_classes[i] = reward_processing_class
+
+            self.reward_processing_classes = reward_processing_classes
 
         # Rollout function
         if rollout_func is not None and os.environ.get("TRL_EXPERIMENTAL_SILENCE", "0") != "1":
@@ -626,15 +654,17 @@ class GRPOTrainer(BaseTrainer):
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
 
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, PreTrainedModel):
-                if self.is_deepspeed_enabled:
-                    self.reward_funcs[i] = prepare_deepspeed(reward_func, self.accelerator)
-                else:
-                    # set device placement to True to make `prepare_model` move `reward_func` to device when using fsdp
-                    self.reward_funcs[i] = self.accelerator.prepare_model(
-                        reward_func, evaluation_mode=True, device_placement=True
-                    )
+        # Prepare reward functions (skip in trajectory mode)
+        if not args.trajectory_mode:
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(reward_func, PreTrainedModel):
+                    if self.is_deepspeed_enabled:
+                        self.reward_funcs[i] = prepare_deepspeed(reward_func, self.accelerator)
+                    else:
+                        # set device placement to True to make `prepare_model` move `reward_func` to device when using fsdp
+                        self.reward_funcs[i] = self.accelerator.prepare_model(
+                            reward_func, evaluation_mode=True, device_placement=True
+                        )
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
