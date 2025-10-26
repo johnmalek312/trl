@@ -1498,17 +1498,31 @@ class GRPOTrainer(BaseTrainer):
                 gen_inputs.append(inp)
 
             # PARALLEL GENERATION: Generate for all active trajectories at once
-            # Use existing _generate method
+            # Prepare prompts and images (if present) similar to standard path
+            prompts_for_gen = gen_prompts
+
             if has_images:
-                # For multimodal, need to prepare inputs with images
-                prompts_for_gen = gen_prompts
                 # Convert to list of lists format (each prompt can have multiple images)
                 images_for_gen = [[img] if img is not None else None for img in gen_images]
-                # Prepare multimodal messages
-                prompts_for_gen = [prepare_multimodal_messages(prompt, image_list)
-                                   for prompt, image_list in zip(prompts_for_gen, images_for_gen)]
-            else:
-                prompts_for_gen = gen_prompts
+
+                # For multimodal inputs, prompts MUST be in conversation format
+                # Check first prompt to ensure it's properly formatted
+                if len(prompts_for_gen) > 0:
+                    first_prompt = prompts_for_gen[0]
+                    if not (isinstance(first_prompt, list) and
+                            len(first_prompt) > 0 and
+                            isinstance(first_prompt[0], dict) and
+                            "role" in first_prompt[0]):
+                        raise ValueError(
+                            "Trajectory mode with images requires environment to return prompts in conversation format. "
+                            "Environment's reset() and step() should return:\n"
+                            "{'prompt': [{'role': 'user', 'content': 'text'}], 'image': <PIL.Image>}\n"
+                            f"Got prompt type: {type(first_prompt)}, value: {first_prompt}"
+                        )
+
+                    # Prepare multimodal messages (embeds images into conversation)
+                    prompts_for_gen = [prepare_multimodal_messages(prompt, image_list)
+                                      for prompt, image_list in zip(prompts_for_gen, images_for_gen)]
 
             # Call _generate (handles chat template, tokenization, etc.)
             # This is the existing TRL method
