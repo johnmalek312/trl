@@ -360,6 +360,15 @@ class GRPOConfig(TrainingArguments):
             "Set lower to save disk space. Only used when `log_trajectories=True`."
         },
     )
+    trajectory_loss_batch_size: int = field(
+        default=64,
+        metadata={
+            "help": "Maximum number of turns to process at once during loss computation for trajectory mode. "
+            "When trajectories contain many turns (e.g., 100+), this batches the forward pass to prevent OOM. "
+            "Lower values use less VRAM but are slower. Set to -1 to disable batching (process all turns at once). "
+            "Only used when `trajectory_mode=True`."
+        },
+    )
     ds3_gather_for_generation: bool = field(
         default=True,
         metadata={

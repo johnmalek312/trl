@@ -2282,6 +2282,16 @@ class GRPOTrainer(BaseTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
+        # TRAJECTORY MODE: Batch computation for many turns to avoid OOM
+        num_turns = input_ids.size(0)
+        max_turns_per_batch = self.args.trajectory_loss_batch_size
+
+        # Only batch if configured (trajectory_loss_batch_size != -1) and we exceed the limit
+        if max_turns_per_batch > 0 and num_turns > max_turns_per_batch:
+            # Chunk the computation
+            return self._compute_loss_batched(model, inputs, max_turns_per_batch)
+
+        # Standard path: compute all at once
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
@@ -2402,6 +2412,159 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+        return loss
+
+    def _compute_loss_batched(self, model, inputs, max_turns_per_batch):
+        """
+        Compute loss in batches to handle long trajectories without OOM.
+
+        Args:
+            model: The model to compute loss for
+            inputs: Full inputs dict with all turns
+            max_turns_per_batch: Maximum number of turns to process at once (e.g., 64)
+
+        Returns:
+            loss: Accumulated loss across all batches
+        """
+        prompt_ids = inputs["prompt_ids"]
+        completion_ids = inputs["completion_ids"]
+        num_turns = prompt_ids.size(0)
+
+        # We'll accumulate loss across batches
+        total_loss = 0.0
+        total_completion_tokens = 0
+
+        # Process in chunks
+        for start_idx in range(0, num_turns, max_turns_per_batch):
+            end_idx = min(start_idx + max_turns_per_batch, num_turns)
+
+            # Create batch inputs
+            batch_inputs = {
+                "prompt_ids": prompt_ids[start_idx:end_idx],
+                "prompt_mask": inputs["prompt_mask"][start_idx:end_idx],
+                "completion_ids": completion_ids[start_idx:end_idx],
+                "completion_mask": inputs["completion_mask"][start_idx:end_idx],
+                "advantages": inputs["advantages"][start_idx:end_idx],
+            }
+
+            # Handle optional inputs
+            if "old_per_token_logps" in inputs and inputs["old_per_token_logps"] is not None:
+                batch_inputs["old_per_token_logps"] = inputs["old_per_token_logps"][start_idx:end_idx]
+
+            if "ref_per_token_logps" in inputs and inputs["ref_per_token_logps"] is not None:
+                batch_inputs["ref_per_token_logps"] = inputs["ref_per_token_logps"][start_idx:end_idx]
+
+            if "importance_sampling_ratio" in inputs and inputs["importance_sampling_ratio"] is not None:
+                batch_inputs["importance_sampling_ratio"] = inputs["importance_sampling_ratio"][start_idx:end_idx]
+
+            # Handle multimodal inputs (if present)
+            for key in ["pixel_values", "image_grid_thw", "num_images", "pixel_attention_mask", "image_sizes", "token_type_ids"]:
+                if key in inputs and inputs[key] is not None:
+                    batch_inputs[key] = inputs[key][start_idx:end_idx]
+
+            # Forward pass for this batch (will use standard _compute_loss since batch_size <= max_turns_per_batch)
+            # Temporarily override inputs to prevent recursion
+            batch_input_ids = torch.cat([batch_inputs["prompt_ids"], batch_inputs["completion_ids"]], dim=1)
+            batch_attention_mask = torch.cat([batch_inputs["prompt_mask"], batch_inputs["completion_mask"]], dim=1)
+            logits_to_keep = batch_inputs["completion_ids"].size(1)
+
+            # Compute per_token_logps for this batch
+            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                model,
+                batch_input_ids,
+                batch_attention_mask,
+                logits_to_keep,
+                compute_entropy=True,
+                pixel_values=batch_inputs.get("pixel_values"),
+                image_grid_thw=batch_inputs.get("image_grid_thw"),
+                num_images=batch_inputs.get("num_images"),
+                pixel_attention_mask=batch_inputs.get("pixel_attention_mask"),
+                image_sizes=batch_inputs.get("image_sizes"),
+                token_type_ids=batch_inputs.get("token_type_ids"),
+            )
+
+            # Compute entropy mask if needed
+            if self.top_entropy_quantile < 1.0:
+                entropy_mask = self.get_high_entropy_mask(entropies, batch_inputs["completion_mask"], 1 - self.top_entropy_quantile)
+            else:
+                entropy_mask = None
+
+            # Compute KL divergence
+            if self.beta != 0.0:
+                ref_per_token_logps = batch_inputs["ref_per_token_logps"]
+                per_token_kl = (
+                    torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+                )
+
+            # Compute loss for this batch
+            advantages = batch_inputs["advantages"]
+            old_per_token_logps = batch_inputs.get("old_per_token_logps")
+            old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
+
+            log_ratio = per_token_logps - old_per_token_logps
+            if self.importance_sampling_level == "token":
+                log_importance_weights = log_ratio
+            elif self.importance_sampling_level == "sequence":
+                log_importance_weights = (log_ratio * batch_inputs["completion_mask"]).sum(-1) / batch_inputs["completion_mask"].sum(-1).clamp(min=1.0)
+                log_importance_weights = log_importance_weights.unsqueeze(-1)
+
+            coef_1 = torch.exp(log_importance_weights)
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+
+            if self.args.delta is not None:
+                coef_1 = torch.clamp(coef_1, max=self.args.delta)
+
+            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+            if entropy_mask is not None:
+                per_token_loss = per_token_loss * entropy_mask
+
+            if self.use_vllm and self.vllm_importance_sampling_correction:
+                per_token_loss = per_token_loss * batch_inputs["importance_sampling_ratio"]
+
+            if self.beta != 0.0:
+                per_token_loss = per_token_loss + self.beta * per_token_kl
+
+            # Accumulate loss (sum across tokens, then we'll divide by total tokens at the end)
+            batch_completion_tokens = batch_inputs["completion_mask"].sum().item()
+
+            if self.loss_type == "grpo":
+                batch_loss = ((per_token_loss * batch_inputs["completion_mask"]).sum(-1) / batch_inputs["completion_mask"].sum(-1).clamp(min=1.0)).sum()
+                # Weight by number of sequences in this batch
+                total_loss += batch_loss
+                total_completion_tokens += (end_idx - start_idx)  # Number of sequences
+            elif self.loss_type == "bnpo":
+                batch_loss = (per_token_loss * batch_inputs["completion_mask"]).sum()
+                total_loss += batch_loss
+                total_completion_tokens += batch_completion_tokens
+            elif self.loss_type == "dr_grpo":
+                batch_loss = (per_token_loss * batch_inputs["completion_mask"]).sum()
+                total_loss += batch_loss
+                total_completion_tokens += (end_idx - start_idx) * self.max_completion_length
+            elif self.loss_type == "dapo":
+                # For DAPO, we need the global normalizer, so we handle this specially
+                batch_loss = (per_token_loss * batch_inputs["completion_mask"]).sum()
+                total_loss += batch_loss
+                total_completion_tokens += batch_completion_tokens
+
+        # Compute final loss based on loss type
+        if self.loss_type == "grpo":
+            loss = total_loss / num_turns  # Average over sequences
+        elif self.loss_type == "bnpo":
+            loss = total_loss / total_completion_tokens  # Average over tokens
+        elif self.loss_type == "dr_grpo":
+            loss = total_loss / total_completion_tokens  # Already computed correctly
+        elif self.loss_type == "dapo":
+            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
+            loss = total_loss / normalizer
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        # Apply gradient accumulation scaling
+        loss = loss / self.current_gradient_accumulation_steps
+
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
