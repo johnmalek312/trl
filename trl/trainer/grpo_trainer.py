@@ -1428,16 +1428,15 @@ class GRPOTrainer(BaseTrainer):
 
         # Initialize trajectories
         # Shape: (num_prompts, num_generations)
+        # NOTE: We do NOT store initial_input or current_data to avoid memory leaks with images
         trajectories = [
             [
                 {
-                    "initial_input": inputs[i],
                     "env": environments[i][j],
                     "turns": [],
                     "done": False,
                     "terminated_naturally": False,
                     "trajectory_length": 0,
-                    "current_data": None,  # Will be set after env.reset()
                 }
                 for j in range(num_generations)
             ]
@@ -1449,6 +1448,18 @@ class GRPOTrainer(BaseTrainer):
             for j in range(num_generations):
                 traj = trajectories[i][j]
                 traj["current_data"] = traj["env"].reset()
+
+        # Initialize trajectory logger if needed (do this ONCE, not per-turn)
+        if self.args.log_trajectories and self.accelerator.is_main_process:
+            if not hasattr(self, "_trajectory_logger"):
+                from .trajectory_logger import TrajectoryLogger
+                self._trajectory_logger = TrajectoryLogger(
+                    output_dir=self.args.trajectory_log_dir,
+                    save_images=True,
+                    save_prompts=True,
+                    save_responses=True,
+                    max_trajectories_per_step=self.args.max_logged_trajectories_per_step,
+                )
 
         # Turn-by-turn parallel generation
         turn_idx = 0
@@ -1537,9 +1548,11 @@ class GRPOTrainer(BaseTrainer):
                     completion_ids_list[idx], skip_special_tokens=True
                 )
 
-                # Store turn data
+                # Get current_data before stepping (will be replaced)
+                current_data_for_step = traj.get("current_data")
+
+                # Store turn data (DO NOT copy current_data - it contains images!)
                 turn_data = {
-                    "current_data": traj["current_data"].copy(),
                     "prompt_ids": prompt_ids_list[idx],
                     "completion": completion_text,
                     "completion_ids": completion_ids_list[idx],
@@ -1549,8 +1562,23 @@ class GRPOTrainer(BaseTrainer):
                 traj["turns"].append(turn_data)
                 traj["trajectory_length"] += 1
 
+                # LOG TURN IMMEDIATELY (while image is still in memory)
+                if self.args.log_trajectories and self.accelerator.is_main_process and hasattr(self, "_trajectory_logger"):
+                    # Save this turn (with image from current_data)
+                    image = current_data_for_step.get("image") if current_data_for_step else None
+                    self._trajectory_logger.log_turn(
+                        step=self.state.global_step,
+                        prompt_idx=prompt_idx,
+                        gen_idx=gen_idx,
+                        turn_idx=turn_idx,
+                        prompt_ids=prompt_ids_list[idx],
+                        completion=completion_text,
+                        image=image,
+                        processing_class=self.processing_class,
+                    )
+
                 # Step environment with current_data and llm_response
-                new_data, done, info = traj["env"].step(traj["current_data"], completion_text)
+                new_data, done, info = traj["env"].step(current_data_for_step, completion_text)
 
                 traj["done"] = done
                 traj["terminated_naturally"] = done
@@ -1634,6 +1662,20 @@ class GRPOTrainer(BaseTrainer):
         self._logs["rewards"]["environment"].extend(rewards.tolist())
         self._logs["advantages"].extend(result["advantages"].tolist())
 
+        # Finalize trajectories logging (save rewards and metadata)
+        if self.args.log_trajectories and self.accelerator.is_main_process and hasattr(self, "_trajectory_logger"):
+            self._trajectory_logger.finalize_trajectories(
+                trajectories=trajectories,
+                step=self.state.global_step,
+                mode=mode,
+            )
+
+        # CRITICAL: Delete trajectories to free memory (contains environment instances with images!)
+        # Each trajectory holds references to: initial_input (images), env (images), current_data (images)
+        del trajectories
+        del prompts_text
+        del completions_text
+
         return result
 
     def _flatten_trajectories(
@@ -1658,6 +1700,13 @@ class GRPOTrainer(BaseTrainer):
         """
         num_prompts = len(trajectories)
         num_generations = len(trajectories[0])
+
+        # MEMORY OPTIMIZATION: Clear current_data from all trajectories to free image memory
+        for i in range(num_prompts):
+            for j in range(num_generations):
+                traj = trajectories[i][j]
+                if "current_data" in traj:
+                    del traj["current_data"]  # May contain PIL images!
 
         # Collect all turns and rewards
         all_prompt_ids = []

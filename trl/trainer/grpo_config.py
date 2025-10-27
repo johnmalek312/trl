@@ -340,6 +340,26 @@ class GRPOConfig(TrainingArguments):
             "If set, trajectories exceeding this length will be terminated early. Only used when `trajectory_mode=True`."
         },
     )
+    log_trajectories: bool = field(
+        default=True,
+        metadata={
+            "help": "Save trajectory generation details (images, prompts, responses, rewards) to disk for inspection. "
+            "Only used when `trajectory_mode=True`. Creates HTML reports for easy visualization."
+        },
+    )
+    trajectory_log_dir: str = field(
+        default="./trajectory_logs",
+        metadata={
+            "help": "Directory to save trajectory logs. Only used when `log_trajectories=True`."
+        },
+    )
+    max_logged_trajectories_per_step: int = field(
+        default=10,
+        metadata={
+            "help": "Maximum number of trajectories to log per training step. "
+            "Set lower to save disk space. Only used when `log_trajectories=True`."
+        },
+    )
     ds3_gather_for_generation: bool = field(
         default=True,
         metadata={
