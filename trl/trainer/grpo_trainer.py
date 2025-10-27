@@ -1561,14 +1561,80 @@ class GRPOTrainer(BaseTrainer):
 
             turn_idx += 1
 
-        # Extract rewards from environments
+        # Extract rewards from environments and collect trajectory-level rewards
+        trajectory_rewards_list = []  # List of rewards: (num_prompts * num_generations,)
         for i in range(num_prompts):
             for j in range(num_generations):
                 traj = trajectories[i][j]
                 traj["reward"] = traj["env"].get_reward()
+                trajectory_rewards_list.append(traj["reward"])
 
         # Flatten trajectories for loss computation
-        return self._flatten_trajectories(trajectories, device)
+        result = self._flatten_trajectories(trajectories, device)
+
+        # Log trajectory rewards (similar to standard GRPO reward logging)
+        mode = "train" if self.model.training else "eval"
+
+        # Convert rewards to tensor and gather across processes
+        rewards = torch.tensor(trajectory_rewards_list, dtype=torch.float32, device=device)
+        rewards = gather(rewards)
+
+        # Compute grouped rewards (mean per prompt group)
+        mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
+
+        # Compute reward statistics
+        if self.args.scale_rewards in ["group", "none"]:
+            std_rewards = rewards.view(-1, num_generations).std(dim=1)
+            std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
+        elif self.args.scale_rewards == "batch":
+            std_rewards = rewards.std().expand_as(rewards)
+        else:
+            std_rewards = torch.zeros_like(rewards)
+
+        is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+
+        # Log trajectory reward metrics
+        # Note: In trajectory mode, we use a single "environment" reward function
+        self._metrics[mode]["rewards/environment/mean"].append(rewards.mean().item())
+        self._metrics[mode]["rewards/environment/std"].append(rewards.std().item())
+        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+        self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        # Log trajectory-specific metrics
+        trajectory_lengths = [traj["trajectory_length"] for row in trajectories for traj in row]
+        trajectory_lengths_tensor = torch.tensor(trajectory_lengths, dtype=torch.float32, device=device)
+        trajectory_lengths_tensor = gather(trajectory_lengths_tensor)
+
+        self._metrics[mode]["trajectory/mean_length"].append(trajectory_lengths_tensor.float().mean().item())
+        self._metrics[mode]["trajectory/min_length"].append(trajectory_lengths_tensor.float().min().item())
+        self._metrics[mode]["trajectory/max_length"].append(trajectory_lengths_tensor.float().max().item())
+
+        # Log prompts, completions, and advantages
+        # For trajectories, concatenate all turns into a single prompt/completion pair for logging
+        prompts_text = []
+        completions_text = []
+
+        for i in range(num_prompts):
+            for j in range(num_generations):
+                traj = trajectories[i][j]
+                if len(traj["turns"]) > 0:
+                    # Show first prompt and concatenate all completions with " | " separator
+                    first_turn = traj["turns"][0]
+                    first_prompt_text = self.processing_class.decode(first_turn["prompt_ids"], skip_special_tokens=True)
+                    all_completions = " | ".join([turn["completion"] for turn in traj["turns"]])
+                    prompts_text.append(first_prompt_text)
+                    completions_text.append(all_completions)
+                else:
+                    prompts_text.append("")
+                    completions_text.append("")
+
+        self._logs["prompt"].extend(gather_object(prompts_text))
+        self._logs["completion"].extend(gather_object(completions_text))
+        self._logs["rewards"]["environment"].extend(rewards.tolist())
+        self._logs["advantages"].extend(result["advantages"].tolist())
+
+        return result
 
     def _flatten_trajectories(
         self,
