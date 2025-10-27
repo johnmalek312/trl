@@ -1452,7 +1452,7 @@ class GRPOTrainer(BaseTrainer):
         # Initialize trajectory logger if needed (do this ONCE, not per-turn)
         if self.args.log_trajectories and self.accelerator.is_main_process:
             if not hasattr(self, "_trajectory_logger"):
-                from .trajectory_logger import TrajectoryLogger
+                from trl.trainer.trajectory_logger import TrajectoryLogger
                 self._trajectory_logger = TrajectoryLogger(
                     output_dir=self.args.trajectory_log_dir,
                     save_images=True,
