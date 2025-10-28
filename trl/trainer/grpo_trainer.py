@@ -250,9 +250,9 @@ class GRPOTrainer(BaseTrainer):
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
 
-        # Validate reward_funcs vs trajectory_mode
+        # Handle trajectory mode dataset creation
         if args.trajectory_mode:
-            # In trajectory mode, rewards come from environment.get_reward()
+            # In trajectory mode, create dummy dataset and ignore reward_funcs
             if reward_funcs is not None:
                 logger.warning(
                     "You specified both `trajectory_mode=True` and `reward_funcs`. "
@@ -260,6 +260,20 @@ class GRPOTrainer(BaseTrainer):
                     "The `reward_funcs` will be ignored."
                 )
             reward_funcs = None  # Ensure it's None for trajectory mode
+
+            # Create dummy dataset if not provided
+            if train_dataset is None:
+                from datasets import Dataset
+                logger.info(
+                    f"trajectory_mode=True: Creating dummy dataset with {args.num_episodes} episodes."
+                )
+                dummy_data = {"episode_id": list(range(args.num_episodes))}
+                train_dataset = Dataset.from_dict(dummy_data)
+            else:
+                logger.warning(
+                    "trajectory_mode=True: train_dataset provided but will be ignored. "
+                    "Environment generates episodes via initialize()."
+                )
         else:
             # Standard GRPO mode requires reward_funcs
             if reward_funcs is None:
@@ -672,7 +686,12 @@ class GRPOTrainer(BaseTrainer):
         # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
         # Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
-            self._signature_columns = ["prompt", "image", "images"]
+            if self.args.trajectory_mode:
+                # In trajectory mode, we use dummy dataset with episode_id
+                self._signature_columns = ["episode_id"]
+            else:
+                # Standard GRPO mode
+                self._signature_columns = ["prompt", "image", "images"]
 
     # This method overrides `Trainer.get_train_dataloader` to support our custom batching strategy.
     # Instead of returning a standard per-step batch (i.e., `per_device_batch_size), our dataloader loads an
@@ -1407,32 +1426,67 @@ class GRPOTrainer(BaseTrainer):
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         """
-        Generate multiple trajectories per prompt in parallel (turn-by-turn).
+        Generate multiple trajectories per episode in parallel (turn-by-turn).
+
+        In trajectory mode, inputs are dummy placeholders (episode indices).
+        Actual episode data comes from environment.initialize() and environment.reset().
 
         Args:
-            inputs: List of dataset items with "prompt", "image", etc.
+            inputs: List of dummy dataset items (ignored in trajectory mode)
 
         Returns:
             dict with flattened trajectory data ready for loss computation
         """
+        import time
+        timings = {}
+        mode = "train" if self.model.training else "eval"
+
+        # Start total timer
+        total_start = time.time()
+
         device = self.accelerator.device
-        num_prompts = len(inputs)
+        num_episodes = len(inputs)  # Number of episodes in this batch
         num_generations = self.args.num_generations
 
-        # Create environment instances
-        # Shape: (num_prompts, num_generations)
-        environments = [
-            [self.args.environment_fn(inputs[i]) for _ in range(num_generations)]
-            for i in range(num_prompts)
-        ]
+        # Create and initialize environment instances
+        # Shape: (num_episodes, num_generations)
+        # Calculate global episode ID base (unique across training)
+        base_episode_id = self.state.global_step * num_episodes
+
+        # Time: Environment initialization
+        env_init_start = time.time()
+        environments = []
+        episode_ids = []
+        episode_metadata = []
+
+        for i in range(num_episodes):
+            episode_id = base_episode_id + i
+            episode_envs = []
+
+            for j in range(num_generations):
+                # Create environment (no arguments!)
+                env = self.args.environment_fn()
+
+                # Initialize environment with episode_id
+                metadata = env.initialize(episode_id=episode_id)
+
+                episode_envs.append(env)
+
+            environments.append(episode_envs)
+            episode_ids.append(episode_id)
+            episode_metadata.append(metadata if metadata else {})
+
+        timings["env_initialization"] = time.time() - env_init_start
 
         # Initialize trajectories
-        # Shape: (num_prompts, num_generations)
+        # Shape: (num_episodes, num_generations)
         # NOTE: We do NOT store initial_input or current_data to avoid memory leaks with images
         trajectories = [
             [
                 {
                     "env": environments[i][j],
+                    "episode_id": episode_ids[i],
+                    "metadata": episode_metadata[i],
                     "turns": [],
                     "done": False,
                     "terminated_naturally": False,
@@ -1440,14 +1494,16 @@ class GRPOTrainer(BaseTrainer):
                 }
                 for j in range(num_generations)
             ]
-            for i in range(num_prompts)
+            for i in range(num_episodes)
         ]
 
-        # Reset all environments to get initial prompt data
-        for i in range(num_prompts):
+        # Time: Environment reset
+        env_reset_start = time.time()
+        for i in range(num_episodes):
             for j in range(num_generations):
                 traj = trajectories[i][j]
                 traj["current_data"] = traj["env"].reset()
+        timings["env_reset"] = time.time() - env_reset_start
 
         # Initialize trajectory logger if needed (do this ONCE, not per-turn)
         if self.args.log_trajectories and self.accelerator.is_main_process:
@@ -1465,6 +1521,11 @@ class GRPOTrainer(BaseTrainer):
         turn_idx = 0
         max_turns = self.args.max_trajectory_length
 
+        # Track per-turn timings
+        turn_generation_times = []
+        turn_step_times = []
+        generation_loop_start = time.time()
+
         while True:
             # Check if we've hit max_turns limit (if set)
             if max_turns is not None and turn_idx >= max_turns:
@@ -1472,9 +1533,9 @@ class GRPOTrainer(BaseTrainer):
 
             # Get all active trajectories (not done yet)
             active_trajectories = []
-            active_indices = []  # (prompt_idx, gen_idx) pairs
+            active_indices = []  # (episode_idx, gen_idx) pairs
 
-            for i in range(num_prompts):
+            for i in range(num_episodes):
                 for j in range(num_generations):
                     if not trajectories[i][j]["done"]:
                         active_trajectories.append(trajectories[i][j])
@@ -1535,9 +1596,13 @@ class GRPOTrainer(BaseTrainer):
                     prompts_for_gen = [prepare_multimodal_messages(prompt, image_list)
                                       for prompt, image_list in zip(prompts_for_gen, images_for_gen)]
 
-            # Call _generate (handles chat template, tokenization, etc.)
-            # This is the existing TRL method
+            # Time: Generation for this turn
+            gen_start = time.time()
             prompt_ids_list, completion_ids_list, _, sampling_logps_list, _ = self._generate(prompts_for_gen)
+            turn_generation_times.append(time.time() - gen_start)
+
+            # Time: Environment stepping for this turn
+            step_start = time.time()
 
             # Process each generated completion
             for idx, (prompt_idx, gen_idx) in enumerate(active_indices):
@@ -1587,18 +1652,25 @@ class GRPOTrainer(BaseTrainer):
                 if not done:
                     traj["current_data"] = new_data
 
+            turn_step_times.append(time.time() - step_start)
             turn_idx += 1
 
-        # Extract rewards from environments and collect trajectory-level rewards
+        timings["generation_loop_total"] = time.time() - generation_loop_start
+
+        # Time: Reward computation
+        reward_start = time.time()
         trajectory_rewards_list = []  # List of rewards: (num_prompts * num_generations,)
-        for i in range(num_prompts):
+        for i in range(num_episodes):
             for j in range(num_generations):
                 traj = trajectories[i][j]
                 traj["reward"] = traj["env"].get_reward()
                 trajectory_rewards_list.append(traj["reward"])
+        timings["reward_computation"] = time.time() - reward_start
 
-        # Flatten trajectories for loss computation
+        # Time: Flatten trajectories
+        flatten_start = time.time()
         result = self._flatten_trajectories(trajectories, device)
+        timings["flatten_trajectories"] = time.time() - flatten_start
 
         # Log trajectory rewards (similar to standard GRPO reward logging)
         mode = "train" if self.model.training else "eval"
@@ -1643,7 +1715,7 @@ class GRPOTrainer(BaseTrainer):
         prompts_text = []
         completions_text = []
 
-        for i in range(num_prompts):
+        for i in range(num_episodes):
             for j in range(num_generations):
                 traj = trajectories[i][j]
                 if len(traj["turns"]) > 0:
@@ -1676,6 +1748,24 @@ class GRPOTrainer(BaseTrainer):
         del prompts_text
         del completions_text
 
+        # Calculate total time and per-turn averages
+        timings["total_time"] = time.time() - total_start
+        if turn_generation_times:
+            timings["avg_generation_per_turn"] = sum(turn_generation_times) / len(turn_generation_times)
+            timings["max_generation_per_turn"] = max(turn_generation_times)
+            timings["min_generation_per_turn"] = min(turn_generation_times)
+        if turn_step_times:
+            timings["avg_env_step_per_turn"] = sum(turn_step_times) / len(turn_step_times)
+
+        # Log all timing metrics
+        for key, value in timings.items():
+            self._metrics[mode][f"timing/trajectory/{key}"].append(value)
+
+        # Also log turn-by-turn breakdown for first 5 turns
+        for i, (gen_time, step_time) in enumerate(zip(turn_generation_times[:5], turn_step_times[:5])):
+            self._metrics[mode][f"timing/trajectory/turn_{i}/generation"].append(gen_time)
+            self._metrics[mode][f"timing/trajectory/turn_{i}/env_step"].append(step_time)
+
         return result
 
     def _flatten_trajectories(
@@ -1698,11 +1788,11 @@ class GRPOTrainer(BaseTrainer):
                 - old_per_token_logps, ref_per_token_logps: if applicable
                 - num_items_in_batch: total number of tokens (for DAPO)
         """
-        num_prompts = len(trajectories)
+        num_episodes = len(trajectories)
         num_generations = len(trajectories[0])
 
         # MEMORY OPTIMIZATION: Clear current_data from all trajectories to free image memory
-        for i in range(num_prompts):
+        for i in range(num_episodes):
             for j in range(num_generations):
                 traj = trajectories[i][j]
                 if "current_data" in traj:
@@ -1715,7 +1805,7 @@ class GRPOTrainer(BaseTrainer):
         trajectory_rewards = []  # Shape: (num_prompts, num_generations)
         trajectory_turn_counts = []  # Number of turns per trajectory
 
-        for i in range(num_prompts):
+        for i in range(num_episodes):
             prompt_group_rewards = []
             for j in range(num_generations):
                 traj = trajectories[i][j]
@@ -1737,7 +1827,7 @@ class GRPOTrainer(BaseTrainer):
         # Expand advantages to per-turn level
         # Each turn in a trajectory gets the same advantage
         all_advantages = []
-        for i in range(num_prompts):
+        for i in range(num_episodes):
             for j in range(num_generations):
                 traj_advantage = advantages_per_trajectory[i][j]
                 num_turns = trajectory_turn_counts[i * num_generations + j]

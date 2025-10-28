@@ -325,11 +325,12 @@ class GRPOConfig(TrainingArguments):
     environment_fn: Optional[Callable] = field(
         default=None,
         metadata={
-            "help": "Function that creates environment instances for trajectory generation. Should accept a dataset "
-            "item (dict) and return an environment object with:\n"
-            "  - reset() -> dict: Returns initial prompt data with keys 'prompt' (str or list) and 'image' (PIL.Image or None)\n"
-            "  - step(current_data: dict, llm_response: str) -> (new_data: dict, done: bool, info: dict)\n"
-            "  - get_reward() -> float\n"
+            "help": "Function that creates environment instances: environment_fn() -> Environment. "
+            "Environment must implement:\n"
+            "  - initialize(episode_id: int) -> dict: Initialize episode (returns metadata)\n"
+            "  - reset() -> dict: Get initial prompt {'prompt': str/list, 'image': PIL.Image or None}\n"
+            "  - step(prompt_data: dict, llm_response: str) -> (new_data: dict, done: bool, info: dict)\n"
+            "  - get_reward() -> float: Return final reward\n"
             "Required when `trajectory_mode=True`."
         },
     )
@@ -338,6 +339,13 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "Maximum number of turns per trajectory. If None, trajectories continue until environment signals done. "
             "If set, trajectories exceeding this length will be terminated early. Only used when `trajectory_mode=True`."
+        },
+    )
+    num_episodes: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of episodes to generate when trajectory_mode=True. Each episode creates num_generations "
+            "trajectories. Total trajectories = num_episodes * num_generations. If None, defaults to 1000."
         },
     )
     log_trajectories: bool = field(
@@ -702,6 +710,10 @@ class GRPOConfig(TrainingArguments):
                 raise ValueError("trajectory_mode=True requires environment_fn to be specified")
             if self.max_trajectory_length is not None and self.max_trajectory_length < 1:
                 raise ValueError(f"max_trajectory_length must be >= 1 or None, got {self.max_trajectory_length}")
+
+            # Set default num_episodes if not specified
+            if self.num_episodes is None:
+                self.num_episodes = 1000
 
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
 
