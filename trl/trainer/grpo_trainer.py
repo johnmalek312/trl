@@ -1450,8 +1450,15 @@ class GRPOTrainer(BaseTrainer):
 
         # Create and initialize environment instances
         # Shape: (num_episodes, num_generations)
-        # Calculate global episode ID base (unique across training)
-        base_episode_id = self.state.global_step * num_episodes
+        # Calculate episode ID base (loops across epochs based on dummy dataset indices)
+        # This ensures episode IDs repeat across epochs: epoch 1: 0-99, epoch 2: 0-99, etc.
+        # Use dummy dataset item's episode_id if available, otherwise use step-based calculation
+        if inputs and isinstance(inputs[0], dict) and "episode_id" in inputs[0]:
+            # Get episode IDs from dummy dataset (loops naturally across epochs)
+            base_episode_id = inputs[0]["episode_id"]
+        else:
+            # Fallback: modulo to loop episode IDs
+            base_episode_id = (self.state.global_step * num_episodes) % self.args.num_episodes
 
         # Time: Environment initialization
         env_init_start = time.time()
@@ -1460,7 +1467,12 @@ class GRPOTrainer(BaseTrainer):
         episode_metadata = []
 
         for i in range(num_episodes):
-            episode_id = base_episode_id + i
+            # Get episode_id from dummy dataset or calculate with modulo
+            if inputs and isinstance(inputs[i], dict) and "episode_id" in inputs[i]:
+                episode_id = inputs[i]["episode_id"]
+            else:
+                episode_id = (base_episode_id + i) % self.args.num_episodes
+
             episode_envs = []
 
             for j in range(num_generations):
