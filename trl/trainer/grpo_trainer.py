@@ -1660,7 +1660,12 @@ class GRPOTrainer(BaseTrainer):
                 traj["done"] = done
                 traj["terminated_naturally"] = done
 
-                # Update current_data for next turn
+                # MEMORY: Clear old current_data immediately to free image memory
+                if "current_data" in traj:
+                    del traj["current_data"]
+                del current_data_for_step
+
+                # Update current_data for next turn (if not done)
                 if not done:
                     traj["current_data"] = new_data
 
@@ -1754,11 +1759,32 @@ class GRPOTrainer(BaseTrainer):
                 mode=mode,
             )
 
-        # CRITICAL: Delete trajectories to free memory (contains environment instances with images!)
-        # Each trajectory holds references to: initial_input (images), env (images), current_data (images)
+        # CRITICAL: Explicitly clear environment instances and their image data BEFORE deleting trajectories
+        # This prevents VRAM/RAM leaks from PIL images held in environment objects
+        for i in range(num_episodes):
+            for j in range(num_generations):
+                env = trajectories[i][j]["env"]
+                # Clear all image/data references in environment
+                if hasattr(env, "image"):
+                    env.image = None
+                if hasattr(env, "responses"):
+                    env.responses = None
+                if hasattr(env, "current_data"):
+                    del env.current_data
+                # Delete environment instance
+                del trajectories[i][j]["env"]
+                del env
+
+        # Delete trajectory structures
         del trajectories
+        del environments
         del prompts_text
         del completions_text
+
+        # Force garbage collection and clear CUDA cache to free memory immediately
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Calculate total time and per-turn averages
         timings["total_time"] = time.time() - total_start
@@ -2650,6 +2676,16 @@ class GRPOTrainer(BaseTrainer):
                 batch_loss = (per_token_loss * batch_inputs["completion_mask"]).sum()
                 total_loss += batch_loss
                 total_completion_tokens += batch_completion_tokens
+
+            # MEMORY: Clear intermediate tensors to free VRAM between batches
+            del per_token_logps, entropies, per_token_loss, per_token_loss1, per_token_loss2
+            del coef_1, coef_2, log_ratio, log_importance_weights
+            del batch_inputs, batch_input_ids, batch_attention_mask
+            if self.beta != 0.0:
+                del per_token_kl
+            if entropy_mask is not None:
+                del entropy_mask
+            torch.cuda.empty_cache()
 
         # Compute final loss based on loss type
         if self.loss_type == "grpo":
