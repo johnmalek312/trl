@@ -1613,13 +1613,66 @@ class GRPOTrainer(BaseTrainer):
             prompt_ids_list, completion_ids_list, _, sampling_logps_list, _ = self._generate(prompts_for_gen)
             turn_generation_times.append(time.time() - gen_start)
 
-            # Check for vision models (not currently supported in trajectory mode)
+            # VISION: Process images and store on CPU (not GPU) to avoid VRAM accumulation
+            cpu_forward_kwargs_list = []
             if has_images:
-                raise ValueError(
-                    "Trajectory mode does not currently support vision models due to VRAM constraints. "
-                    "With hundreds of trajectory turns, storing pixel_values for each turn would require "
-                    "60+ GB of VRAM. Use standard GRPO for vision-language models."
+                # Prepare data for image processing
+                prompts_text_for_processing = []
+                images_for_processing = []
+
+                for traj in active_trajectories:
+                    current_data = traj.get("current_data")
+                    if current_data:
+                        prompt = current_data.get("prompt", "")
+                        image = current_data.get("image")
+
+                        # Apply chat template to get text
+                        prompt_text = apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"]
+                        prompts_text_for_processing.append(prompt_text)
+                        images_for_processing.append([image] if image is not None else None)
+                    else:
+                        prompts_text_for_processing.append("")
+                        images_for_processing.append(None)
+
+                # Process all images at once (efficient batch processing)
+                prompt_inputs = self.processing_class(
+                    images=images_for_processing,
+                    text=prompts_text_for_processing,
+                    padding=True,
+                    return_tensors="pt"
                 )
+                # CRITICAL: Don't call super()._prepare_inputs() - keeps tensors on CPU!
+
+                # Extract per-sample forward_kwargs and keep on CPU
+                num_active = len(active_trajectories)
+                for idx in range(num_active):
+                    sample_forward_kwargs = {}
+
+                    for key, value in prompt_inputs.items():
+                        # Skip input_ids and attention_mask (we already have them)
+                        if key in ["input_ids", "attention_mask"]:
+                            continue
+
+                        # Handle tensors
+                        if isinstance(value, torch.Tensor):
+                            # Check if batched (first dim = num_active)
+                            if value.size(0) == num_active:
+                                # Extract this sample, keep batch dim, ensure CPU
+                                sample_forward_kwargs[key] = value[idx:idx+1].cpu()
+                            else:
+                                # Non-batched tensor (e.g., shared metadata)
+                                sample_forward_kwargs[key] = value.cpu() if value.is_cuda else value
+                        else:
+                            # Non-tensor data (lists, ints, etc.)
+                            sample_forward_kwargs[key] = value
+
+                    cpu_forward_kwargs_list.append(sample_forward_kwargs)
+
+                # Free CPU memory - prompt_inputs holds full batch
+                del prompt_inputs, prompts_text_for_processing, images_for_processing
+            else:
+                # Text-only: empty forward_kwargs for each trajectory
+                cpu_forward_kwargs_list = [{}] * len(active_trajectories)
 
             # Time: Environment stepping for this turn
             step_start = time.time()
@@ -1636,13 +1689,14 @@ class GRPOTrainer(BaseTrainer):
                 # Get current_data before stepping (will be replaced)
                 current_data_for_step = traj.get("current_data")
 
-                # Store turn data
+                # Store turn data with CPU forward_kwargs
                 turn_data = {
                     "prompt_ids": prompt_ids_list[idx],
                     "completion": completion_text,
                     "completion_ids": completion_ids_list[idx],
                     "sampling_logps": sampling_logps_list[idx] if sampling_logps_list else None,
                     "turn_idx": turn_idx,
+                    "forward_kwargs_cpu": cpu_forward_kwargs_list[idx],  # CPU tensors!
                 }
                 traj["turns"].append(turn_data)
                 traj["trajectory_length"] += 1
@@ -1853,6 +1907,7 @@ class GRPOTrainer(BaseTrainer):
         all_prompt_ids = []
         all_completion_ids = []
         all_sampling_logps = []
+        all_forward_kwargs_cpu = []  # Collect CPU forward_kwargs from each turn
         trajectory_rewards = []  # Shape: (num_prompts, num_generations)
         trajectory_turn_counts = []  # Number of turns per trajectory
 
@@ -1869,6 +1924,13 @@ class GRPOTrainer(BaseTrainer):
                     if turn["sampling_logps"] is not None:
                         all_sampling_logps.append(turn["sampling_logps"])
 
+                    # Collect forward_kwargs_cpu (contains pixel_values, etc on CPU for vision models)
+                    all_forward_kwargs_cpu.append(turn.get("forward_kwargs_cpu", {}))
+
+                    # Clear from turn to free CPU memory after extracting
+                    if "forward_kwargs_cpu" in turn:
+                        del turn["forward_kwargs_cpu"]
+
             trajectory_rewards.append(prompt_group_rewards)
 
         # Compute group-relative advantages
@@ -1884,7 +1946,7 @@ class GRPOTrainer(BaseTrainer):
                 num_turns = trajectory_turn_counts[i * num_generations + j]
                 all_advantages.extend([traj_advantage] * num_turns)
 
-        # Convert to tensors and pad
+        # Convert to tensors and pad (always on target device)
         prompt_ids = [torch.tensor(ids, device=device) for ids in all_prompt_ids]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
         prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
@@ -1928,7 +1990,7 @@ class GRPOTrainer(BaseTrainer):
         # This is the total number of active tokens across all turns
         num_items_in_batch = completion_mask.sum().item()
 
-        return {
+        result_dict = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -1939,6 +2001,74 @@ class GRPOTrainer(BaseTrainer):
             "importance_sampling_ratio": importance_sampling_ratio,
             "num_items_in_batch": num_items_in_batch,
         }
+
+        # TRAJECTORY MODE: Add forward_kwargs_cpu for batched processing
+        # Unsloth will handle batching and CPU→GPU transfer internally
+        if all_forward_kwargs_cpu and any(all_forward_kwargs_cpu):
+            result_dict["forward_kwargs_cpu"] = all_forward_kwargs_cpu
+
+        return result_dict
+
+    def _consolidate_and_move_to_gpu(
+        self,
+        forward_kwargs_cpu_list: list[dict],
+        device: torch.device
+    ) -> dict:
+        """
+        Consolidate CPU tensors from list of dicts and move to GPU.
+
+        For vision models in trajectory mode, this takes per-turn forward_kwargs stored on CPU
+        and consolidates them into batched tensors on GPU for efficient forward pass.
+
+        Args:
+            forward_kwargs_cpu_list: List of dicts, each containing CPU tensors (pixel_values, etc)
+            device: Target GPU device
+
+        Returns:
+            Single dict with concatenated GPU tensors ready for model forward pass
+        """
+        if not forward_kwargs_cpu_list or not any(forward_kwargs_cpu_list):
+            return {}
+
+        # Find all keys across all dicts
+        all_keys = set()
+        for kwargs in forward_kwargs_cpu_list:
+            all_keys.update(kwargs.keys())
+
+        result = {}
+
+        for key in all_keys:
+            values = []
+
+            for kwargs in forward_kwargs_cpu_list:
+                if key in kwargs and kwargs[key] is not None:
+                    values.append(kwargs[key])
+
+            if not values:
+                continue
+
+            # Handle different data types
+            if isinstance(values[0], torch.Tensor):
+                # Concatenate tensors and move to GPU
+                try:
+                    concatenated = torch.cat(values, dim=0)
+                    result[key] = concatenated.to(device)
+                    # Free CPU tensors and intermediate immediately
+                    del values, concatenated
+                except RuntimeError:
+                    # If concat fails (shape mismatch), keep as list on GPU
+                    result[key] = [v.to(device) for v in values]
+                    del values
+
+            elif key == "num_images":
+                # Special case: list of image counts per sample
+                result[key] = values
+
+            else:
+                # For other types, take first value if all same, else keep list
+                result[key] = values[0] if len(set(map(str, values))) == 1 else values
+
+        return result
 
     def _compute_trajectory_advantages(
         self,
@@ -2513,12 +2643,33 @@ class GRPOTrainer(BaseTrainer):
             if "importance_sampling_ratio" in inputs and inputs["importance_sampling_ratio"] is not None:
                 batch_inputs["importance_sampling_ratio"] = inputs["importance_sampling_ratio"][start_idx:end_idx]
 
-            # Handle multimodal inputs (if present)
-            for key in ["pixel_values", "image_grid_thw", "num_images", "pixel_attention_mask", "image_sizes", "token_type_ids"]:
-                if key in inputs and inputs[key] is not None:
-                    batch_inputs[key] = inputs[key][start_idx:end_idx]
+            # VISION: Handle forward_kwargs_cpu - transfer batch from CPU to GPU
+            # Check for non-empty dicts (not just empty list or list of empty dicts)
+            has_forward_kwargs = (
+                "forward_kwargs_cpu" in inputs and
+                inputs["forward_kwargs_cpu"] and
+                any(inputs["forward_kwargs_cpu"])
+            )
 
-            # Forward pass for this batch (will use standard _compute_loss since batch_size <= max_turns_per_batch)
+            if has_forward_kwargs:
+                # Extract CPU forward_kwargs for this batch
+                batch_forward_kwargs_cpu = inputs["forward_kwargs_cpu"][start_idx:end_idx]
+
+                # Consolidate and move to GPU (only this batch goes to VRAM!)
+                batch_forward_kwargs_gpu = self._consolidate_and_move_to_gpu(
+                    batch_forward_kwargs_cpu,
+                    device=prompt_ids.device
+                )
+
+                # Add GPU tensors to batch_inputs
+                batch_inputs.update(batch_forward_kwargs_gpu)
+            else:
+                # Handle multimodal inputs if already on GPU (standard GRPO path, not trajectory mode)
+                for key in ["pixel_values", "image_grid_thw", "num_images", "pixel_attention_mask", "image_sizes", "token_type_ids"]:
+                    if key in inputs and inputs[key] is not None:
+                        batch_inputs[key] = inputs[key][start_idx:end_idx]
+
+            # Forward pass for this batch
             # Temporarily override inputs to prevent recursion
             batch_input_ids = torch.cat([batch_inputs["prompt_ids"], batch_inputs["completion_ids"]], dim=1)
             batch_attention_mask = torch.cat([batch_inputs["prompt_mask"], batch_inputs["completion_mask"]], dim=1)
@@ -2608,6 +2759,14 @@ class GRPOTrainer(BaseTrainer):
             # MEMORY: Clear intermediate tensors to free VRAM between batches
             del per_token_logps, entropies, per_token_loss, per_token_loss1, per_token_loss2
             del coef_1, coef_2, log_ratio, log_importance_weights
+
+            # VISION: Explicitly delete GPU tensors from batch_inputs before deleting the dict
+            if has_forward_kwargs:
+                # Delete vision tensors that were moved to GPU for this batch
+                for key in ["pixel_values", "image_grid_thw", "pixel_attention_mask", "image_sizes", "token_type_ids"]:
+                    if key in batch_inputs:
+                        del batch_inputs[key]
+
             del batch_inputs, batch_input_ids, batch_attention_mask
             if self.beta != 0.0:
                 del per_token_kl, ref_per_token_logps
@@ -2649,6 +2808,10 @@ class GRPOTrainer(BaseTrainer):
             loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
         loss_time = time.time() - loss_start
 
+        # MEMORY: Free CPU tensors after loss computation (trajectory mode with vision)
+        if "forward_kwargs_cpu" in inputs:
+            del inputs["forward_kwargs_cpu"]
+
         # Backward pass timing
         backward_start = time.time()
         if self.args.gradient_accumulation_steps > 1:
@@ -2673,6 +2836,11 @@ class GRPOTrainer(BaseTrainer):
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
             loss = loss.mean().detach()
+
+        # MEMORY: Free CPU tensors after loss computation (trajectory mode with vision)
+        if "forward_kwargs_cpu" in inputs:
+            del inputs["forward_kwargs_cpu"]
+
         return loss, None, None
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:

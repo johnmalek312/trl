@@ -341,6 +341,14 @@ class GRPOConfig(TrainingArguments):
             "If set, trajectories exceeding this length will be terminated early. Only used when `trajectory_mode=True`."
         },
     )
+    trajectory_forward_batch_size: int = field(
+        default=32,
+        metadata={
+            "help": "Number of trajectory turns to process simultaneously during forward passes (with Unsloth). "
+            "Lower values reduce VRAM usage but increase training time. For vision models with many turns, "
+            "use smaller values (32 or 16) to avoid OOM. Only used when `trajectory_mode=True`."
+        },
+    )
     num_episodes: Optional[int] = field(
         default=None,
         metadata={
