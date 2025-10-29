@@ -1613,49 +1613,13 @@ class GRPOTrainer(BaseTrainer):
             prompt_ids_list, completion_ids_list, _, sampling_logps_list, _ = self._generate(prompts_for_gen)
             turn_generation_times.append(time.time() - gen_start)
 
-            # CRITICAL FOR VISION: Process images and store pixel_values for loss computation
-            # We need these for the forward pass later, but can't keep PIL images in memory
-            forward_kwargs_list = []
+            # Check for vision models (not currently supported in trajectory mode)
             if has_images:
-                # Process images for this batch of active trajectories
-                prompts_text_for_processing = []
-                images_for_processing = []
-
-                for traj in active_trajectories:
-                    current_data = traj.get("current_data")
-                    if current_data:
-                        prompt = current_data.get("prompt", "")
-                        image = current_data.get("image")
-
-                        # Apply chat template to get text
-                        prompt_text = apply_chat_template({"prompt": prompt}, self.processing_class)["prompt"]
-                        prompts_text_for_processing.append(prompt_text)
-                        images_for_processing.append([image] if image is not None else None)
-                    else:
-                        prompts_text_for_processing.append("")
-                        images_for_processing.append(None)
-
-                # Process all images in batch
-                prompt_inputs = self.processing_class(
-                    images=images_for_processing,
-                    text=prompts_text_for_processing,
-                    padding=True,
-                    return_tensors="pt"
+                raise ValueError(
+                    "Trajectory mode does not currently support vision models due to VRAM constraints. "
+                    "With hundreds of trajectory turns, storing pixel_values for each turn would require "
+                    "60+ GB of VRAM. Use standard GRPO for vision-language models."
                 )
-                prompt_inputs = super()._prepare_inputs(prompt_inputs)
-
-                # Extract forward_kwargs for each sample in batch
-                for idx in range(len(active_trajectories)):
-                    sample_forward_kwargs = {}
-                    for k, v in prompt_inputs.items():
-                        if k not in ["input_ids", "attention_mask"]:
-                            if isinstance(v, torch.Tensor) and v.size(0) == len(active_trajectories):
-                                sample_forward_kwargs[k] = v[idx:idx+1]  # Keep batch dim
-                            else:
-                                sample_forward_kwargs[k] = v
-                    forward_kwargs_list.append(sample_forward_kwargs)
-            else:
-                forward_kwargs_list = [{}] * len(active_trajectories)
 
             # Time: Environment stepping for this turn
             step_start = time.time()
@@ -1672,15 +1636,13 @@ class GRPOTrainer(BaseTrainer):
                 # Get current_data before stepping (will be replaced)
                 current_data_for_step = traj.get("current_data")
 
-                # Store turn data (DO NOT copy current_data - it contains images!)
-                # Store pixel_values and related tensors for vision models
+                # Store turn data
                 turn_data = {
                     "prompt_ids": prompt_ids_list[idx],
                     "completion": completion_text,
                     "completion_ids": completion_ids_list[idx],
                     "sampling_logps": sampling_logps_list[idx] if sampling_logps_list else None,
                     "turn_idx": turn_idx,
-                    "forward_kwargs": forward_kwargs_list[idx],  # Processed image tensors for loss computation
                 }
                 traj["turns"].append(turn_data)
                 traj["trajectory_length"] += 1
@@ -1891,7 +1853,6 @@ class GRPOTrainer(BaseTrainer):
         all_prompt_ids = []
         all_completion_ids = []
         all_sampling_logps = []
-        all_forward_kwargs = []  # Collect forward_kwargs from each turn
         trajectory_rewards = []  # Shape: (num_prompts, num_generations)
         trajectory_turn_counts = []  # Number of turns per trajectory
 
@@ -1907,11 +1868,6 @@ class GRPOTrainer(BaseTrainer):
                     all_completion_ids.append(turn["completion_ids"])
                     if turn["sampling_logps"] is not None:
                         all_sampling_logps.append(turn["sampling_logps"])
-                    # Collect forward_kwargs (contains pixel_values, etc for vision models)
-                    all_forward_kwargs.append(turn.get("forward_kwargs", {}))
-                    # Clear after extracting to prevent memory leak
-                    if "forward_kwargs" in turn:
-                        del turn["forward_kwargs"]
 
             trajectory_rewards.append(prompt_group_rewards)
 
@@ -1972,8 +1928,7 @@ class GRPOTrainer(BaseTrainer):
         # This is the total number of active tokens across all turns
         num_items_in_batch = completion_mask.sum().item()
 
-        # Consolidate forward_kwargs for vision models (pixel_values, etc)
-        result_dict = {
+        return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -1984,22 +1939,6 @@ class GRPOTrainer(BaseTrainer):
             "importance_sampling_ratio": importance_sampling_ratio,
             "num_items_in_batch": num_items_in_batch,
         }
-
-        # Batch forward_kwargs if present (for vision models)
-        if all_forward_kwargs and any(all_forward_kwargs):
-            all_keys = set()
-            for kwargs in all_forward_kwargs:
-                all_keys.update(kwargs.keys())
-
-            for key in all_keys:
-                values = [kwargs[key] for kwargs in all_forward_kwargs if key in kwargs and kwargs[key] is not None]
-                if values and all(isinstance(v, torch.Tensor) for v in values):
-                    try:
-                        result_dict[key] = torch.cat(values, dim=0)
-                    except:
-                        result_dict[key] = values
-
-        return result_dict
 
     def _compute_trajectory_advantages(
         self,
@@ -2606,11 +2545,9 @@ class GRPOTrainer(BaseTrainer):
             else:
                 entropy_mask = None
 
-            # Compute KL divergence (only if beta != 0, which is rare)
+            # Compute KL divergence
             if self.beta != 0.0:
-                ref_per_token_logps = batch_inputs.get("ref_per_token_logps")
-                if ref_per_token_logps is None:
-                    raise ValueError("beta != 0 requires ref_per_token_logps, but trajectory mode doesn't compute it. Set beta=0.0")
+                ref_per_token_logps = batch_inputs["ref_per_token_logps"]
                 per_token_kl = (
                     torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
                 )
