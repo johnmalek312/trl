@@ -715,6 +715,13 @@ class GRPOConfig(TrainingArguments):
             if self.num_episodes is None:
                 self.num_episodes = 1000
 
+            # Auto-set unsloth_num_chunks to num_generations for memory efficiency
+            # This processes loss computation in batches by generation to avoid OOM
+            if hasattr(self, 'unsloth_num_chunks'):
+                if self.unsloth_num_chunks == -1:
+                    self.unsloth_num_chunks = self.num_generations
+                    print(f"Trajectory mode: Auto-setting unsloth_num_chunks={self.num_generations} (num_generations) for memory efficiency")
+
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
 
         num_processes = self.world_size
