@@ -1792,17 +1792,22 @@ class GRPOTrainer(BaseTrainer):
             timings["avg_generation_per_turn"] = sum(turn_generation_times) / len(turn_generation_times)
             timings["max_generation_per_turn"] = max(turn_generation_times)
             timings["min_generation_per_turn"] = min(turn_generation_times)
-        if turn_step_times:
-            timings["avg_env_step_per_turn"] = sum(turn_step_times) / len(turn_step_times)
 
-        # Log all timing metrics
+        # Log timing metrics directly to time/ (not train/time/trajectory/)
+        # Exclude internal metrics: env_initialization, env_reset, env_step, reward_computation, flatten_trajectories, avg_env_step_per_turn
+        exclude_keys = {
+            "env_initialization", "env_reset", "reward_computation",
+            "flatten_trajectories", "avg_env_step_per_turn"
+        }
+
         for key, value in timings.items():
-            self._metrics[mode][f"timing/trajectory/{key}"].append(value)
+            if key not in exclude_keys:
+                # Log directly to time/ instead of train/time/trajectory/
+                self._metrics[mode][f"time/{key}"].append(value)
 
-        # Also log turn-by-turn breakdown for first 5 turns
-        for i, (gen_time, step_time) in enumerate(zip(turn_generation_times[:5], turn_step_times[:5])):
-            self._metrics[mode][f"timing/trajectory/turn_{i}/generation"].append(gen_time)
-            self._metrics[mode][f"timing/trajectory/turn_{i}/env_step"].append(step_time)
+        # Log turn-by-turn generation times only (exclude env_step)
+        for i, gen_time in enumerate(turn_generation_times[:3]):
+            self._metrics[mode][f"time/turn_{i}_generation"].append(gen_time)
 
         return result
 
@@ -2403,6 +2408,10 @@ class GRPOTrainer(BaseTrainer):
             return self._compute_loss(model, inputs)
 
     def _compute_loss(self, model, inputs):
+        import time
+        loss_start = time.time()
+        mode = "train" if self.model.training else "eval"
+
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -2421,6 +2430,7 @@ class GRPOTrainer(BaseTrainer):
 
         # Standard path: compute all at once
         # Compute the per_token_logps and the entropy at each position in the completion
+        forward_start = time.time()
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
@@ -2540,6 +2550,13 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+        # Log timing metrics
+        forward_time = time.time() - forward_start
+        total_loss_time = time.time() - loss_start
+        self._metrics[mode]["time/forward_pass"].append(forward_time)
+        self._metrics[mode]["time/loss_computation"].append(total_loss_time)
+
         return loss
 
     def _compute_loss_batched(self, model, inputs, max_turns_per_batch):
@@ -2704,6 +2721,40 @@ class GRPOTrainer(BaseTrainer):
         loss = loss / self.current_gradient_accumulation_steps
 
         return loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """
+        Override training_step to add detailed timing metrics for backpropagation and optimizer steps.
+        """
+        import time
+        mode = "train" if model.training else "eval"
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # Loss computation (already timed internally in compute_loss)
+        loss_start = time.time()
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+        loss_time = time.time() - loss_start
+
+        # Backward pass timing
+        backward_start = time.time()
+        if self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
+
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+        backward_time = time.time() - backward_start
+
+        # Log timing
+        self._metrics[mode]["time/backward_pass"].append(backward_time)
+        self._metrics[mode]["time/loss_plus_backward"].append(loss_time + backward_time)
+
+        return loss.detach() / self.args.gradient_accumulation_steps
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
         inputs = self._prepare_inputs(inputs)
